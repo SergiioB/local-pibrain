@@ -12,8 +12,6 @@ Combines:
 
 1. **Chat with your data** - Web UI + CLI to query all your AI conversations, notes, documents
 2. **Knowledge Indexing** - Ingest from multiple sources (Pi, Claude, Codex, Gemini, Factory, Qwen Code, etc.)
-3. **Morning Briefing** - Daily digest of important items and pending actions
-4. **arXiv Workflow** - Fetch, score, and triage AI research papers
 
 All local, all private.
 
@@ -66,9 +64,6 @@ python scripts/ingest/embedding.py
 
 # Start web UI (chat interface)
 python scripts/web_server.py
-
-# Generate morning briefing
-python scripts/briefing/build_briefing.py
 
 # Query knowledge base
 python scripts/query.py "search term" --db data/state.db
@@ -160,7 +155,7 @@ localbrain/
 | Privacy redaction | Yes (built-in) | Partial | Varies |
 | No Docker required | Yes | No | Varies |
 | Multi-platform | Yes (GPU + CPU) | Optional | Varies |
-| Personal workflows | Yes | Generic | Generic |
+| Open source | Yes | Yes | Varies |
 | SQLite-only | Yes | ES/MySQL | Varies |
 
 ## Rules
