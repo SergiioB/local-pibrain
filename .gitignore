@@ -1,0 +1,20 @@
+# LocalBrain
+*.pyc
+__pycache__/
+data/state.db
+data/state.db.*
+data/*.json
+data/*.jsonl
+data/*.html
+data/*.txt
+data/*.log
+data/*.py
+data/logs/
+data/manifests/
+data/reports/
+models/*.gguf
+exports/takeout-*.zip
+exports/*.jsonl
+runtime/reports/
+runtime/drafts/
+runtime/previews/  

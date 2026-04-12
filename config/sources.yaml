@@ -1,0 +1,76 @@
+# Knowledge sources configuration for personal AI node
+# Raw exports live in the project-local exports/ directory by default.
+
+exports_root: exports
+
+sources:
+  normalized_archive:
+    path_pattern: "**/normalized_conversations.jsonl"
+    type: conversation
+    priority: 0
+    categories: [chat, code, tool, reasoning]
+
+  # AI assistant conversations
+  droid:
+    path_pattern: "**/droid_conversations_*.jsonl"
+    type: conversation
+    priority: 1
+    categories: [code, tool, reasoning, chat]
+
+  factory:
+    path_pattern: "**/factory_conversations.jsonl"
+    type: conversation
+    priority: 1
+    categories: [code, tool, reasoning, chat]
+
+  qwen_code:
+    path_pattern: "**/qwen_code_conversations.jsonl"
+    type: conversation
+    priority: 1
+    categories: [code, tool, reasoning, chat]
+
+  opencode:
+    path_pattern: "**/opencode_conversations_*.jsonl"
+    type: conversation
+    priority: 2
+    categories: [code, tool, reasoning]
+
+  codex:
+    path_pattern: "**/codex_conversations_*.jsonl"
+    type: conversation
+    priority: 2
+    categories: [code, reasoning]
+
+  gemini_cli:
+    path_pattern: "**/gemini_conversations_*.jsonl"
+    type: conversation
+    priority: 3
+    categories: [code, reasoning]
+
+  pi_mono:
+    path_pattern: "**/pi_mono_conversations_*.jsonl"
+    type: conversation
+    priority: 3
+    categories: [code, tool]
+
+  gemini_web:
+    # Google Takeout archive
+    path_pattern: "**/takeout-*.zip"
+    type: archive
+    priority: 4
+    extract_to: gemini-web-extracted
+    categories: [chat, reasoning]
+
+# Ingestion settings
+ingestion:
+  batch_size: 1000
+  chunk_size_chars: 512
+  chunk_overlap_chars: 64
+  max_file_size_mb: 500
+  incremental: true
+  
+# Processing limits for ARM64 hardware
+limits:
+  max_concurrent_files: 4
+  embedding_batch_size: 32
+  timeout_seconds: 300

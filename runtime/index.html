@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LocalBrain - Personal AI</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <section class="hero">
+    <h1>LocalBrain</h1>
+    <p>Chat with your personal knowledge base. All data stays local, inference runs on your GPU.</p>
+    <div class="cards">
+      <div class="card"><div class="label">Database</div><div class="value" id="db-records">0</div><div class="small">Records</div></div>
+      <div class="card"><div class="label">Chunks</div><div class="value" id="db-chunks">0</div><div class="small">Indexed</div></div>
+      <div class="card"><div class="label">Model</div><div class="value" id="model-name">Loading...</div><div class="small">LLM</div></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Chat</h2>
+    <p>Ask questions about your indexed conversations, notes, and documents.</p>
+    <textarea id="question" placeholder="What have I discussed about fan control on Rock 5B?"></textarea>
+    <div class="controls">
+      <label class="toggle"><input type="checkbox" id="genAnswer" checked><span>Generate answer with LLM</span></label>
+      <label>Top K <input type="number" id="topK" value="5" min="1" max="20" style="width:60px"></label>
+      <button id="askBtn">Ask</button>
+    </div>
+    <div class="output" id="answer">Ask a question to search your knowledge base.</div>
+    <div class="output" id="passages">Passages will appear here.</div>
+  </section>
+
+  <section class="panel">
+    <h2>Recent Activity</h2>
+    <div id="recent-activity">Loading...</div>
+  </section>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

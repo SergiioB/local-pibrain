@@ -1,0 +1,29 @@
+{
+  "name": "Your Name",
+  "location": "Your Location",
+  "timezone": "Your Timezone",
+  "interests": [
+    "AI development",
+    "local LLM inference",
+    "embedded systems"
+  ],
+  "hardware": {
+    "gpu": "Your GPU",
+    "sbc": "Your SBC",
+    "ram_system": "Your RAM"
+  },
+  "tools_used": [
+    "Pi",
+    "Claude Code",
+    "Codex",
+    "OpenCode",
+    "Cursor",
+    "Gemini",
+    "llama.cpp"
+  ],
+  "projects": [
+    "Your Project 1",
+    "Your Project 2"
+  ],
+  "notes": "All data is private and stored locally. No cloud APIs used except optional arXiv fetch."
+}

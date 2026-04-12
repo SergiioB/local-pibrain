@@ -1,0 +1,51 @@
+# Model configuration for local inference with llama.cpp.
+# Supports CPU, Apple Silicon, and NVIDIA/AMD GPU acceleration.
+
+inference:
+  engine: llama.cpp
+
+  # Model directory (place GGUF files here)
+  models_dir: models
+
+  # Default model - change to match what you downloaded
+  default_model: qwen3.5-4b-q4_k_m.gguf
+
+  # llama.cpp server settings
+  server:
+    host: 127.0.0.1
+    port: 8080
+    threads: 4            # CPU threads for non-GPU parts
+    context_size: 8192    # Context window
+    gpu_layers: 99        # 99 = full GPU offload, 0 = CPU only
+    batch_size: 512
+
+  # Timeout settings
+  timeout_seconds: 120
+
+  # Generation settings
+  max_tokens_per_request: 2048
+  temperature: 0.1
+  top_p: 0.9
+
+embedding:
+  # Embedding model for knowledge retrieval
+  model: all-MiniLM-L6-v2
+
+  # Use sqlite-vec for local vector storage
+  use_sqlite_vec: true
+
+  # Embedding dimensions
+  dimensions: 384
+
+  # Batch size for embedding
+  batch_size: 64
+
+  # Cache embeddings
+  cache_enabled: true
+  cache_dir: data/cache/embeddings
+
+# Web server for chat UI
+web_server:
+  enabled: true
+  host: 127.0.0.1
+  port: 8096

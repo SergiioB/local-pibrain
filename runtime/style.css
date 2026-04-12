@@ -1,0 +1,42 @@
+:root {
+  --bg: #0b1117;
+  --panel: #121b24;
+  --panel2: #172430;
+  --text: #e9eef2;
+  --muted: #93a4b5;
+  --accent: #f2b766;
+  --line: rgba(255,255,255,0.09);
+  --ok: #82d49d;
+  --bad: #ff8b7f;
+}
+* { box-sizing: border-box; }
+body { margin:0; color:var(--text); font-family:"Segoe UI",system-ui,sans-serif; background:var(--bg); min-height:100vh; }
+.shell { max-width:980px; margin:0 auto; padding:24px 16px; }
+.hero,.panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:20px; margin-bottom:16px; }
+h1 { margin:0 0 8px 0; font-size:1.5rem; }
+h2 { margin:0 0 8px 0; font-size:1.2rem; }
+p { color:var(--muted); margin:0; line-height:1.5; }
+.cards { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:16px; }
+.card { background:var(--panel2); border-radius:8px; padding:12px; }
+.label { color:var(--accent); font-size:0.75rem; text-transform:uppercase; letter-spacing:0.05em; font-weight:600; }
+.value { font-size:1.2rem; font-weight:700; margin-top:4px; }
+.small { color:var(--muted); font-size:0.85rem; }
+textarea,input,button,select { width:100%; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--text); padding:10px 12px; font:inherit; margin-top:8px; }
+textarea { min-height:100px; resize:vertical; }
+button { cursor:pointer; background:var(--accent); color:#17120d; font-weight:600; }
+button:hover { filter:brightness(1.1); }
+button:disabled { opacity:0.5; cursor:wait; }
+.controls { display:grid; grid-template-columns:1fr auto auto; gap:12px; margin-top:12px; align-items:end; }
+.toggle { display:flex; align-items:center; gap:8px; }
+.toggle input { width:18px; height:18px; }
+.output { background:var(--panel2); border-radius:8px; padding:16px; margin-top:16px; white-space:pre-wrap; line-height:1.5; max-height:500px; overflow-y:auto; }
+.passage { padding:12px 0; border-top:1px solid var(--line); }
+.passage:first-child { border-top:none; padding-top:0; }
+.status-ok { color:var(--ok); }
+.status-bad { color:var(--bad); }
+#recent-activity { max-height:200px; overflow-y:auto; }
+.recent-item { padding:6px 0; border-bottom:1px solid var(--line); font-size:0.9rem; }
+.recent-item:last-child { border-bottom:none; }
+.recent-item .r-cat { color:var(--accent); font-weight:600; }
+.recent-item .r-date { color:var(--muted); font-size:0.8rem; }
+@media (max-width:600px) { .cards { grid-template-columns:1fr; } .controls { grid-template-columns:1fr; } }
