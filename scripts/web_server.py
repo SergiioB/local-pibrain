@@ -130,11 +130,14 @@ def db_counts():
 
 
 def _normalize_query(query: str) -> str:
-    """Normalize query: lowercase, remove accents, keep meaningful terms."""
+    """Normalize query: lowercase, remove accents, strip punctuation."""
     import unicodedata
+    import re
     text = unicodedata.normalize("NFKD", query.lower())
     text = text.encode("ascii", "ignore").decode("ascii")
-    return text
+    # Strip all punctuation and special characters
+    text = re.sub(r'[^\w\s]', ' ', text)
+    return text.strip()
 
 
 # Query expansion map for common tech terms
@@ -152,9 +155,14 @@ _QUERY_EXPANSIONS = {
     "android": "app mobile kotlin java gradle",
     "ai": "llm model inference embedding llamacpp",
     "tool": "cli utility script command",
-    "project": "repo codebase application repository",
-    "disk": "storage ssd hdd sdcard mount",
-    "memory": "ram swap memory",
+    "project": "repo codebase application repository proyecto app bot sistema",
+    "proyecto": "project app bot sistema desarrollo codigo",
+    "work": "task build implement fix feature code",
+    "disk": "storage ssd hdd sdcard mount disco duro",
+    "memory": "ram swap memoria",
+    "que": "que cual cuales",
+    "como": "how configurar setup configure",
+    "cual": "which what cual",
 }
 
 
@@ -309,22 +317,43 @@ def retrieve(query, top_k, use_reranker=False):
                     elif title_quality > 0.3 and len(title) > 15:
                         title_quality = 1.3
 
-                    # 5. Recency
+                    # 5. Personal context signal: does the chunk sound like
+                    # the user's own setup (first-person, confirmation) vs shopping list?
+                    personal_indicators = [
+                        'i have', 'my ', 'tengo', 'mi ', 'compre', 'compré',
+                        'bought', 'i own', 'i use', 'i run', 'i set up',
+                        'configured', 'installed', 'currently using',
+                        'actualmente', 'en mi ', 'configuré', 'configuro',
+                    ]
+                    personal_score = sum(1 for ind in personal_indicators if ind in text_lower)
+                    personal_signal = min(personal_score / 3.0, 1.0)  # capped at 1.0
+
+                    # Shopping/research noise penalty
+                    shopping_indicators = [
+                        'comparar', '€', 'opiniones', 'envío gratis', 'entrega',
+                        'specifications', 'techpowerup', 'datab', 'choose between',
+                        'which laptop', 'qué portátil', 'mejores ofertas',
+                    ]
+                    shopping_score = sum(1 for ind in shopping_indicators if ind in text_lower)
+                    shopping_penalty = min(shopping_score * 0.3, 1.0)  # up to -1.0
+
+                    # 6. Recency
                     recency = _recency_weight(created_at)
 
-                    # 6. Importance from metadata
+                    # 7. Importance from metadata
                     importance = meta.get('importance', 0.5)
 
-                    # 7. Variant bonus: original query matches score higher than expanded
+                    # 8. Variant bonus: original query matches score higher than expanded
                     variant_bonus = 1.0 if variant_idx == 0 else 0.8
 
                     # Final composite score
-                    # Weighted to prioritize: term matches > title signal > recency > importance
                     score = (
                         match_ratio * 4.0 +           # Core: how many terms matched (0-4)
                         min(term_density, 5.0) * 0.6 +  # Term density, capped (0-3)
                         title_score * 3.0 +            # Title match signal (0-3)
                         title_quality * 1.5 +           # Title quality (0.45-1.95)
+                        personal_signal * 2.0 +         # Personal context bonus (0-2)
+                        -shopping_penalty * 1.5 +       # Shopping list penalty (-1.5 to 0)
                         recency * 1.2 +                 # Freshness (0.37-1.2)
                         importance * 0.8 +              # Pre-computed importance (0-0.8)
                         variant_bonus                   # Original query bonus
@@ -393,6 +422,7 @@ def _build_personal_info():
     if not _personal:
         return ""
 
+    # Detect placeholder values — skip fields with template text
     placeholders = {"your name", "your location", "your timezone", "your gpu", "your ram",
                     "your sbc", "your project", "your project 1", "your project 2",
                     "your ram_system", "your hardware"}
@@ -411,6 +441,7 @@ def _build_personal_info():
             return True
         return val.lower().strip() in placeholders
 
+    # Only include info if real values exist (not placeholders)
     has_real_name = not is_placeholder(name)
     has_real_location = not is_placeholder(location)
 
@@ -425,7 +456,11 @@ def _build_personal_info():
         if real_interests:
             lines.append(f"- Interests: {', '.join(real_interests)}")
     if hardware and not all(is_placeholder(v) for v in hardware.values()):
-        parts = [f"{k}: {v}" for k, v in hardware.items() if not is_placeholder(v)]
+        parts = []
+        for k, v in hardware.items():
+            if not is_placeholder(v):
+                label = k.replace("_", " ").title()
+                parts.append(f"{label}: {v}")
         if parts:
             lines.append(f"- Hardware: {'; '.join(parts)}")
     if tools and not all(is_placeholder(t) for t in tools):
@@ -463,9 +498,12 @@ def generate_answer(question, context):
         "RULES:\n"
         "1. If the question asks about personal info (name, location, hardware, tools, projects, interests), "
         "answer from the ABOUT section above.\n"
-        "2. For other questions, answer ONLY from the provided context passages.\n"
-        "3. If context doesn't contain the answer, say: 'I don't have that information in your knowledge base.'\n"
-        "4. Be concise. Cite sources when possible."
+        "2. For other questions, use the provided context passages as your primary source.\n"
+        "3. Synthesize information from the context — if passages mention projects, topics, or activities, "
+        "summarize what you find. Don't just say 'I don't have info' if there are relevant passages.\n"
+        "4. If the context truly doesn't contain relevant information, say: "
+        "'I don't have specific information about that in your knowledge base, but based on what I know...'\n"
+        "5. Be concise and helpful. Cite sources when possible."
     )
 
     if context:
