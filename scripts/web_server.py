@@ -129,57 +129,222 @@ def db_counts():
         conn.close()
 
 
+def _normalize_query(query: str) -> str:
+    """Normalize query: lowercase, remove accents, keep meaningful terms."""
+    import unicodedata
+    text = unicodedata.normalize("NFKD", query.lower())
+    text = text.encode("ascii", "ignore").decode("ascii")
+    return text
+
+
+# Query expansion map for common tech terms
+_QUERY_EXPANSIONS = {
+    "docker": "container podman deploy kubernetes",
+    "container": "docker podman deploy kubernetes",
+    "gpu": "nvidia cuda vram graphics",
+    "hardware": "cpu ram gpu device machine",
+    "database": "sqlite db postgres mysql",
+    "server": "api http backend service",
+    "deploy": "docker container production release",
+    "config": "configuration settings setup options",
+    "network": "dns routing proxy ip address",
+    "fan": "cooling thermal temperature pwm heat",
+    "android": "app mobile kotlin java gradle",
+    "ai": "llm model inference embedding llamacpp",
+    "tool": "cli utility script command",
+    "project": "repo codebase application repository",
+    "disk": "storage ssd hdd sdcard mount",
+    "memory": "ram swap memory",
+}
+
+
+def _expand_query(query: str) -> list[str]:
+    """Expand query with related terms for better recall.
+    Returns list of query variants to try."""
+    queries = [query]
+    terms = _normalize_query(query).split()
+
+    # Add expanded variant
+    expanded_terms = []
+    for t in terms:
+        if len(t) >= 3:
+            expanded_terms.append(t)
+            if t in _QUERY_EXPANSIONS:
+                expanded_terms.extend(_QUERY_EXPANSIONS[t].split())
+    if expanded_terms != terms:
+        queries.append(" ".join(expanded_terms))
+
+    return queries
+
+
+def _format_timestamp(ts) -> str:
+    """Format timestamp to human-readable date."""
+    if not ts:
+        return "unknown"
+    ts_str = str(ts)
+    # Epoch milliseconds (13 digits)
+    if len(ts_str) == 13 and ts_str.isdigit():
+        from datetime import datetime
+        try:
+            return datetime.utcfromtimestamp(int(ts_str) / 1000).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    # ISO format
+    if "T" in ts_str:
+        return ts_str[:10]
+    return ts_str[:10]
+
+
+def _recency_weight(created_at, decay_days=365):
+    """Exponential recency decay: newer items get higher weight.
+    Weight ranges from 1.0 (today) to ~0.37 (1 year old)."""
+    if not created_at:
+        return 0.5
+    from datetime import datetime, timezone
+    ts_str = str(created_at)
+    try:
+        if len(ts_str) == 13 and ts_str.isdigit():
+            dt = datetime.utcfromtimestamp(int(ts_str) / 1000)
+        elif "T" in ts_str:
+            dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            if dt.tzinfo:
+                dt = dt.replace(tzinfo=None)
+        else:
+            dt = datetime.fromisoformat(ts_str[:10])
+        days_old = (datetime.now() - dt).days
+        if days_old < 0:
+            days_old = 0
+        import math
+        return math.exp(-days_old / decay_days)
+    except Exception:
+        return 0.5
+
+
 def retrieve(query, top_k, use_reranker=False):
-    """Retrieve using FTS5-powered search (direct, no extra checks)."""
+    """Retrieve using FTS5-powered search with query expansion,
+    recency weighting, and metadata boosting."""
     if not DB_PATH.exists():
         return []
 
-    # Direct FTS5 query — fastest path, no module indirection
     if _fts5_ready:
         conn = _get_db_connection()
-        results = []
+        all_results = {}  # keyed by chunk_id for dedup
+
         try:
-            terms = [t for t in query.lower().split() if len(t) > 2]
-            if not terms:
-                return []
-            fts_query = " OR ".join(terms)
-            rows = conn.execute(
-                """SELECT rowid, chunk_text, title, source_type, content_record_id
-                   FROM chunks_fts
-                   WHERE chunks_fts MATCH ?
-                   ORDER BY rank
-                   LIMIT ?""",
-                (fts_query, top_k),
-            ).fetchall()
+            # Try original query + expanded variants
+            query_variants = _expand_query(query)
 
-            # Batch fetch created_at for all records at once
-            record_ids = [r[4] for r in rows if r[4]]
-            created_at_map = {}
-            if record_ids:
-                placeholders = ",".join("?" * len(record_ids))
-                for row2 in conn.execute(
-                    f"SELECT id, created_at FROM content_records WHERE id IN ({placeholders})",
-                    record_ids
-                ):
-                    created_at_map[row2[0]] = row2[1]
+            for variant_idx, variant in enumerate(query_variants):
+                terms = [t for t in _normalize_query(variant).split() if len(t) > 2]
+                if not terms:
+                    continue
 
-            for r in rows:
-                chunk_id, text, title, source, record_id = r
-                created_at = created_at_map.get(record_id)
-                score = 0.0
-                text_lower = (text or "").lower()
-                for t in terms:
-                    score += min(text_lower.count(t) * 0.5, 2.0)
-                score += len([t for t in terms if t in text_lower]) * 1.0
-                results.append({
-                    "id": chunk_id, "text": (text or "")[:500], "title": title or "Untitled",
-                    "source": source or "unknown", "created_at": str(created_at) if created_at else "unknown",
-                    "score": round(score, 3),
-                })
+                # FTS5 query
+                fts_query = " OR ".join(terms)
+                candidate_limit = max(top_k * 4, 20)
+
+                rows = conn.execute(
+                    """SELECT rowid, chunk_text, title, source_type, content_record_id, created_at
+                       FROM chunks_fts
+                       WHERE chunks_fts MATCH ?
+                       ORDER BY rank
+                       LIMIT ?""",
+                    (fts_query, candidate_limit),
+                ).fetchall()
+
+                if not rows:
+                    continue
+
+                # Batch fetch metadata
+                record_ids = list(set(r[4] for r in rows if r[4]))
+                metadata_map = {}
+                if record_ids:
+                    placeholders = ",".join("?" * len(record_ids))
+                    for row2 in conn.execute(
+                        f"""SELECT cr.id, cr.created_at, cr.importance_score,
+                                   cr.title as record_title, sf.source_type
+                            FROM content_records cr
+                            JOIN source_files sf ON cr.source_file_id = sf.id
+                            WHERE cr.id IN ({placeholders})""",
+                        record_ids
+                    ):
+                        metadata_map[row2[0]] = {
+                            'created_at': row2[1],
+                            'importance': row2[2] or 0.5,
+                            'record_title': row2[3],
+                            'source_type': row2[4],
+                        }
+
+                for r in rows:
+                    chunk_id, text, title, source, record_id, ft_created = r
+                    if chunk_id in all_results:
+                        continue
+
+                    meta = metadata_map.get(record_id, {})
+                    created_at = meta.get('created_at') or ft_created
+
+                    # --- Composite scoring ---
+                    text_lower = (text or "").lower()
+                    title_lower = (title or "").lower()
+
+                    # 1. Term match ratio: how many query terms actually appear in chunk
+                    matched_terms = [t for t in terms if t in text_lower]
+                    match_ratio = len(matched_terms) / max(len(terms), 1)
+
+                    # 2. Term density: total matches vs text length (penalize long noise)
+                    total_matches = sum(text_lower.count(t) for t in matched_terms)
+                    text_len = max(len(text_lower.split()), 1)
+                    term_density = total_matches / text_len * 100  # per 100 words
+
+                    # 3. Title signal: does the title contain query terms?
+                    title_matches = sum(1 for t in terms if t in title_lower)
+                    title_score = title_matches / max(len(terms), 1)
+
+                    # 4. Title quality: meaningful titles get bonus
+                    title_quality = 1.0
+                    generic_titles = {"untitled", "", "conversation title: title generation request",
+                                      "miactividad.html", "adjuntaste"}
+                    if title_lower.strip() in generic_titles:
+                        title_quality = 0.3
+                    elif title_quality > 0.3 and len(title) > 15:
+                        title_quality = 1.3
+
+                    # 5. Recency
+                    recency = _recency_weight(created_at)
+
+                    # 6. Importance from metadata
+                    importance = meta.get('importance', 0.5)
+
+                    # 7. Variant bonus: original query matches score higher than expanded
+                    variant_bonus = 1.0 if variant_idx == 0 else 0.8
+
+                    # Final composite score
+                    # Weighted to prioritize: term matches > title signal > recency > importance
+                    score = (
+                        match_ratio * 4.0 +           # Core: how many terms matched (0-4)
+                        min(term_density, 5.0) * 0.6 +  # Term density, capped (0-3)
+                        title_score * 3.0 +            # Title match signal (0-3)
+                        title_quality * 1.5 +           # Title quality (0.45-1.95)
+                        recency * 1.2 +                 # Freshness (0.37-1.2)
+                        importance * 0.8 +              # Pre-computed importance (0-0.8)
+                        variant_bonus                   # Original query bonus
+                    )
+
+                    all_results[chunk_id] = {
+                        "id": chunk_id,
+                        "text": (text or "")[:500],
+                        "title": title or (meta.get('record_title') or "Untitled"),
+                        "source": source or meta.get('source_type') or "unknown",
+                        "created_at": _format_timestamp(created_at),
+                        "score": round(score, 3),
+                    }
+
         except (sqlite3.OperationalError, sqlite3.DatabaseError):
             pass
-        if results:
-            return results
+
+        # Sort by composite score and return top_k
+        results = sorted(all_results.values(), key=lambda x: x["score"], reverse=True)
+        return results[:top_k]
 
     # Fallback to hybrid_search module
     if HAS_HYBRID:
@@ -210,6 +375,17 @@ def retrieve(query, top_k, use_reranker=False):
     except Exception:
         pass
     return results
+
+
+def _get_retrieval_method():
+    """Return which retrieval method is active."""
+    if _fts5_ready:
+        return "fts5_direct"
+    if HAS_HYBRID:
+        return "hybrid_search"
+    if HAS_BM25:
+        return "bm25"
+    return "keyword_like"
 
 
 def _build_personal_info():
@@ -381,7 +557,7 @@ class Handler(SimpleHTTPRequestHandler):
             self._json({
                 "records": rec,
                 "chunks": chk,
-                "retrieval": "hybrid" if HAS_HYBRID else ("bm25" if HAS_BM25 else "keyword"),
+                "retrieval": _get_retrieval_method(),
                 "model": get_model_name(),
                 "llm_ready": llm_is_ready(),
             })

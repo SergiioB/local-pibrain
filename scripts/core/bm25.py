@@ -33,6 +33,7 @@ STOP_WORDS = {
 
 def tokenize(text: str) -> list[str]:
     text = text.lower()
+    # Include unicode letters for Spanish/other languages
     tokens = re.findall(r'[a-z0-9\u00c0-\u024f]{3,}', text)
     return [t for t in tokens if t not in STOP_WORDS]
 
