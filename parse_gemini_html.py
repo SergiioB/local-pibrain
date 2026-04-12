@@ -47,7 +47,7 @@ def find_gemini_html_in_zip(zf):
     return targets
 
 
-# Date pattern: "10 abr 2026, 19:55:59 CEST"
+# Date pattern: "10 abr 2026, 19:55:59 CEST" (Google Takeout timestamp format)
 DATE_PATTERN = re.compile(
     r'(\d{1,2}\s+\w{3,9}\s+\d{4},\s+\d{2}:\d{2}:\d{2}\s+\w+)'
 )
