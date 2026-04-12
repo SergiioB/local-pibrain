@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LocalBrain - Personal AI</title>
 <link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/markdown-it@14.1.0/dist/markdown-it.min.js"></script>
 </head>
 <body>
 <div class="shell">
@@ -27,7 +28,7 @@
       <label>Top K <input type="number" id="topK" value="5" min="1" max="20" style="width:60px" title="Number of passages to retrieve. Higher = more context but slower."></label>
       <button id="askBtn">Ask</button>
     </div>
-    <div class="output" id="answer">Ask a question about your data. Ctrl+Enter to submit.</div>
+    <div class="output markdown-output" id="answer">Ask a question about your data. Ctrl+Enter to submit.</div>
     <div class="output" id="passages">Passages will appear here.</div>
   </section>
 

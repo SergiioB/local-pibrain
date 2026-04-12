@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Query the knowledge base for relevant content.
+Optimized: uses FTS5 for fast retrieval, avoids loading all records into memory.
 Supports keyword search, category filtering, and recency sorting.
 """
 
@@ -46,6 +47,15 @@ def normalize_text(text: str | None) -> str:
     text = unicodedata.normalize("NFKD", str(text))
     text = text.encode("ascii", "ignore").decode("ascii")
     return text.lower()
+
+
+def _fts5_available(conn: sqlite3.Connection) -> bool:
+    """Check if FTS5 table exists and is populated."""
+    try:
+        cnt = conn.execute("SELECT count(*) FROM chunks_fts").fetchone()[0]
+        return cnt > 0
+    except (sqlite3.OperationalError, sqlite3.DatabaseError):
+        return False
 
 
 def load_candidate_records(conn: sqlite3.Connection,
@@ -111,9 +121,67 @@ def score_record_match(normalized_text: str, terms: list[str], base_score: float
 def search_keywords(conn: sqlite3.Connection, query: str,
                     category: str = None, source: str = None,
                     limit: int = 20) -> list[dict]:
-    """Search for content matching keywords."""
-    
+    """Search for content matching keywords using FTS5."""
+
     search_terms = query_terms(query)
+
+    # Try FTS5 first
+    if _fts5_available(conn):
+        fts_query = " OR ".join(search_terms) if search_terms else query
+        sql = """
+            SELECT rowid, chunk_text, title, source_type, content_record_id
+            FROM chunks_fts
+            WHERE chunks_fts MATCH ?
+            ORDER BY rank
+            LIMIT ?
+        """
+        params = [fts_query, limit]
+        rows = conn.execute(sql, params).fetchall()
+
+        # Batch fetch metadata
+        record_ids = [r[4] for r in rows if r[4]]
+        metadata_map = {}
+        if record_ids:
+            placeholders = ",".join("?" * len(record_ids))
+            for row2 in conn.execute(
+                f"""SELECT cr.id, cr.created_at, cr.category, cr.importance_score, sf.source_type
+                    FROM content_records cr
+                    JOIN source_files sf ON cr.source_file_id = sf.id
+                    WHERE cr.id IN ({placeholders})""",
+                record_ids
+            ):
+                metadata_map[row2[0]] = {
+                    'created_at': row2[1],
+                    'category': row2[2],
+                    'importance': row2[3],
+                    'source_type': row2[4],
+                }
+
+        results = []
+        for row in rows:
+            chunk_id, text, title, source_type, record_id = row
+            meta = metadata_map.get(record_id, {})
+            score = 0.0
+            if search_terms:
+                text_lower = (text or "").lower()
+                for t in search_terms:
+                    score += min(text_lower.count(t) * 0.5, 2.0)
+                score += len([t for t in search_terms if t in text_lower]) * 1.0
+            results.append({
+                'id': chunk_id,
+                'title': title or (meta.get('title') and meta['title'][:50]) or 'Untitled',
+                'category': meta.get('category') or 'unknown',
+                'importance': meta.get('importance') or 0.5,
+                'created_at': meta.get('created_at') or 'unknown',
+                'metadata': {},
+                'content_preview': (text or "")[:500],
+                'score': round(score, 3),
+                'matched_terms': search_terms,
+            })
+        if results:
+            return results
+
+    # Fallback: old method (loads all records)
     records = load_candidate_records(conn, category=category, source=source)
     required_matches = min_term_matches(search_terms) if search_terms else 0
     scored = []
@@ -164,9 +232,100 @@ def search_keywords(conn: sqlite3.Connection, query: str,
 def retrieve_passages(conn: sqlite3.Connection, query: str,
                       category: str = None, source: str = None,
                       limit: int = 8) -> list[dict]:
-    """Retrieve relevant grounded passages for local answer generation."""
+    """Retrieve relevant passages using FTS5 for fast retrieval."""
 
     terms = query_terms(query)
+
+    # Try FTS5-first approach
+    if _fts5_available(conn):
+        fts_query = " OR ".join(terms) if terms else query
+        sql = """
+            SELECT rowid, chunk_text, title, source_type, content_record_id
+            FROM chunks_fts
+            WHERE chunks_fts MATCH ?
+            ORDER BY rank
+        """
+        params = [fts_query]
+        rows = conn.execute(sql, params).fetchall()
+
+        # Batch fetch metadata for all records at once
+        record_ids = [r[4] for r in rows if r[4]]
+        metadata_map = {}
+        if record_ids:
+            placeholders = ",".join("?" * len(record_ids))
+            cat_filter = " AND cr.category = ?" if category else ""
+            src_filter = " AND sf.source_type = ?" if source else ""
+            cat_params = [category] if category else []
+            src_params = [source] if source else []
+            for row2 in conn.execute(
+                f"""SELECT cr.id, cr.created_at, cr.category, cr.importance_score, sf.source_type
+                    FROM content_records cr
+                    JOIN source_files sf ON cr.source_file_id = sf.id
+                    WHERE cr.id IN ({placeholders}){cat_filter}{src_filter}""",
+                record_ids + cat_params + src_params
+            ):
+                metadata_map[row2[0]] = {
+                    'created_at': row2[1],
+                    'category': row2[2],
+                    'importance': row2[3],
+                    'source_type': row2[4],
+                }
+
+        scored = []
+        for row in rows:
+            chunk_id, text, title, source_type, record_id = row
+            meta = metadata_map.get(record_id)
+            if not meta:
+                continue
+            if not text or len(text) < 20:
+                continue
+
+            importance = meta['importance']
+            score = importance or 0.5
+            matched = []
+            text_lower = normalize_text(text)
+            for term in terms:
+                if term in text_lower:
+                    score += min(text_lower.count(term) * 0.8, 3.0)
+                    matched.append(term)
+
+            if not matched and terms:
+                continue
+
+            score += proximity_bonus(text_lower, matched)
+            score -= code_penalty(text)
+            score += len(set(matched)) * 1.8
+
+            scored.append({
+                'id': record_id,
+                'title': title or 'Untitled',
+                'category': meta['category'] or 'unknown',
+                'importance': importance,
+                'created_at': meta['created_at'] or 'unknown',
+                'metadata': {},
+                'source': meta['source_type'] or source_type or 'unknown',
+                'chunk_text': text,
+                'score': round(score, 3),
+                'matched_terms': sorted(set(matched)),
+            })
+
+        scored.sort(key=lambda item: item['score'], reverse=True)
+        deduped = []
+        seen = set()
+        for item in scored:
+            signature = (
+                item['id'],
+                normalize_text(item['chunk_text'])[:220],
+            )
+            if signature in seen:
+                continue
+            seen.add(signature)
+            deduped.append(item)
+            if len(deduped) >= limit:
+                break
+        return deduped
+
+    # Fallback: old method
     records = load_candidate_records(conn, category=category, source=source)
     required_matches = min_term_matches(terms) if terms else 0
     candidate_records = []
@@ -250,7 +409,7 @@ def search_by_category(conn: sqlite3.Connection, category: str,
                        days: int = 30, limit: int = 20,
                        source: str = None) -> list[dict]:
     """Get recent content by category."""
-    
+
     sql = """
         SELECT cr.id, cr.title, cr.category, cr.importance_score,
                cr.created_at, cr.metadata
@@ -268,7 +427,7 @@ def search_by_category(conn: sqlite3.Connection, category: str,
     params.append(limit)
 
     results = conn.execute(sql, params).fetchall()
-    
+
     return [
         {
             'id': r[0],
@@ -285,11 +444,11 @@ def search_by_category(conn: sqlite3.Connection, category: str,
 def search_recent(conn: sqlite3.Connection, days: int = 7,
                   limit: int = 20, source: str = None) -> list[dict]:
     """Get recent content across all categories."""
-    
+
     sql = """
         SELECT cr.id, cr.title, cr.category, cr.importance_score,
                cr.created_at, cr.metadata,
-               (SELECT chunk_text FROM content_chunks 
+               (SELECT chunk_text FROM content_chunks
                 WHERE content_record_id = cr.id LIMIT 1) as preview
         FROM content_records cr
         JOIN source_files sf ON sf.id = cr.source_file_id
@@ -304,7 +463,7 @@ def search_recent(conn: sqlite3.Connection, days: int = 7,
     params.append(limit)
 
     results = conn.execute(sql, params).fetchall()
-    
+
     return [
         {
             'id': r[0],
@@ -321,25 +480,24 @@ def search_recent(conn: sqlite3.Connection, days: int = 7,
 
 def get_record_detail(conn: sqlite3.Connection, record_id: int) -> dict | None:
     """Get full details of a specific record."""
-    
+
     record = conn.execute(
-        """SELECT cr.id, cr.external_id, cr.title, cr.category, 
+        """SELECT cr.id, cr.external_id, cr.title, cr.category,
                   cr.importance_score, cr.created_at, cr.tags, cr.metadata
            FROM content_records cr
            WHERE cr.id = ?""",
         (record_id,)
     ).fetchone()
-    
+
     if not record:
         return None
-    
-    # Get chunks
+
     chunks = conn.execute(
-        """SELECT chunk_text, chunk_index FROM content_chunks 
+        """SELECT chunk_text, chunk_index FROM content_chunks
            WHERE content_record_id = ? ORDER BY chunk_index""",
         (record_id,)
     ).fetchall()
-    
+
     return {
         'id': record[0],
         'external_id': record[1],
@@ -358,25 +516,24 @@ def run_query(query: str = None, category: str = None,
               source: str = None, limit: int = 20,
               db_path: Path = DB_PATH) -> list[dict] | dict:
     """Run a knowledge query."""
-    
+
     conn = sqlite3.connect(db_path)
-    
+
     try:
         if record_id:
             return get_record_detail(conn, record_id)
-        
+
         if recent_days:
             return search_recent(conn, recent_days, limit=limit, source=source)
-        
+
         if category:
             return search_by_category(conn, category, limit=limit, source=source)
-        
+
         if query:
             return search_keywords(conn, query, source=source, limit=limit)
-        
-        # Default: recent items
+
         return search_recent(conn, 7, limit=limit, source=source)
-        
+
     finally:
         conn.close()
 
@@ -465,9 +622,8 @@ def code_penalty(text: str) -> float:
 
 def print_results(results: list[dict] | dict, format: str = 'text'):
     """Print query results."""
-    
+
     if isinstance(results, dict) and 'chunks' in results:
-        # Single record detail
         print(f"\n=== Record {results['id']} ===")
         print(f"Title: {results['title']}")
         print(f"Category: {results['category']}")
@@ -477,13 +633,13 @@ def print_results(results: list[dict] | dict, format: str = 'text'):
         for i, chunk in enumerate(results['chunks'][:3]):
             print(f"\n[Chunk {i+1}]\n{chunk[:500]}...")
         return
-    
+
     if not results:
         print("No results found")
         return
-    
+
     print(f"\nFound {len(results)} results:\n")
-    
+
     for i, r in enumerate(results, 1):
         if format == 'json':
             print(json.dumps(r, indent=2))
@@ -500,7 +656,7 @@ def print_results(results: list[dict] | dict, format: str = 'text'):
 
 if __name__ == "__main__":
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Query knowledge base")
     parser.add_argument("query", nargs="?", help="Search query")
     parser.add_argument("--category", "-c", help="Filter by category")
@@ -515,9 +671,9 @@ if __name__ == "__main__":
     parser.add_argument("--json", "-j", action="store_true", help="JSON output")
     parser.add_argument("--limit", "-l", type=int, default=20, help="Result limit")
     parser.add_argument("--db", type=Path, default=DB_PATH, help="Database path")
-    
+
     args = parser.parse_args()
-    
+
     if args.answer:
         if not args.query:
             print("--answer requires a query string", file=sys.stderr)
@@ -565,5 +721,5 @@ if __name__ == "__main__":
             limit=args.limit,
             db_path=args.db
         )
-        
+
         print_results(results, format='json' if args.json else 'text')

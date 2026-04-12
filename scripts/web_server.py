@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 LocalBrain - Web server with hybrid RAG + LLM.
-BM25 keyword retrieval + cross-encoder reranking. No vector DB needed.
+FTS5-powered retrieval + optional cross-encoder reranking. Threaded server.
 """
 import json
 import os
@@ -9,7 +9,9 @@ import sqlite3
 import sys
 import time
 import urllib.request
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import SimpleHTTPRequestHandler
+from socketserver import ThreadingMixIn
+from http.server import HTTPServer
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -31,7 +33,7 @@ if PERSONAL_PATH.exists():
     except Exception:
         pass
 
-# --- Hybrid Search (BM25 + cross-encoder reranking) ---
+# --- Hybrid Search (FTS5 BM25 + optional cross-encoder reranking) ---
 try:
     from core.hybrid_search import search as hybrid_search
     HAS_HYBRID = True
@@ -47,6 +49,42 @@ except ImportError:
 
 # --- LLM ---
 LLAMA_URL = os.environ.get("LLAMA_SERVER_URL", "http://127.0.0.1:8080")
+
+# --- Connection pool (simple per-thread reuse) ---
+import threading
+_thread_local = threading.local()
+_fts5_ready = None  # Global flag, set at startup
+
+def _get_db_connection():
+    """Get or create a thread-local database connection."""
+    if not hasattr(_thread_local, 'db_conn') or _thread_local.db_conn is None:
+        _thread_local.db_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        _thread_local.db_conn.row_factory = None
+        _thread_local.db_conn.execute("PRAGMA journal_mode=WAL")
+        _thread_local.db_conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
+        _thread_local.db_conn.execute("PRAGMA temp_store=MEMORY")
+    return _thread_local.db_conn
+
+
+def _check_fts5():
+    """Check FTS5 availability once at startup."""
+    global _fts5_ready
+    if _fts5_ready is not None:
+        return _fts5_ready
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cnt = conn.execute("SELECT count(*) FROM chunks_fts").fetchone()[0]
+        _fts5_ready = cnt > 0
+        conn.close()
+        if _fts5_ready:
+            print(f"  FTS5 index ready ({cnt} entries)")
+        else:
+            print("  FTS5 index not found, falling back to in-memory BM25")
+    except Exception:
+        _fts5_ready = False
+        print("  FTS5 unavailable, falling back to in-memory BM25")
+    return _fts5_ready
+
 
 def _llama_health():
     try:
@@ -91,34 +129,86 @@ def db_counts():
         conn.close()
 
 
-def retrieve(query, top_k):
-    """Retrieve using hybrid search (BM25 + cross-encoder)."""
-    if HAS_HYBRID:
-        return hybrid_search(query, top_k, DB_PATH)
-    if HAS_BM25:
-        return bm25_retrieve(query, top_k)
-    # Ultimate fallback
+def retrieve(query, top_k, use_reranker=False):
+    """Retrieve using FTS5-powered search (direct, no extra checks)."""
     if not DB_PATH.exists():
         return []
-    conn = sqlite3.connect(DB_PATH)
+
+    # Direct FTS5 query — fastest path, no module indirection
+    if _fts5_ready:
+        conn = _get_db_connection()
+        results = []
+        try:
+            terms = [t for t in query.lower().split() if len(t) > 2]
+            if not terms:
+                return []
+            fts_query = " OR ".join(terms)
+            rows = conn.execute(
+                """SELECT rowid, chunk_text, title, source_type, content_record_id
+                   FROM chunks_fts
+                   WHERE chunks_fts MATCH ?
+                   ORDER BY rank
+                   LIMIT ?""",
+                (fts_query, top_k),
+            ).fetchall()
+
+            # Batch fetch created_at for all records at once
+            record_ids = [r[4] for r in rows if r[4]]
+            created_at_map = {}
+            if record_ids:
+                placeholders = ",".join("?" * len(record_ids))
+                for row2 in conn.execute(
+                    f"SELECT id, created_at FROM content_records WHERE id IN ({placeholders})",
+                    record_ids
+                ):
+                    created_at_map[row2[0]] = row2[1]
+
+            for r in rows:
+                chunk_id, text, title, source, record_id = r
+                created_at = created_at_map.get(record_id)
+                score = 0.0
+                text_lower = (text or "").lower()
+                for t in terms:
+                    score += min(text_lower.count(t) * 0.5, 2.0)
+                score += len([t for t in terms if t in text_lower]) * 1.0
+                results.append({
+                    "id": chunk_id, "text": (text or "")[:500], "title": title or "Untitled",
+                    "source": source or "unknown", "created_at": str(created_at) if created_at else "unknown",
+                    "score": round(score, 3),
+                })
+        except (sqlite3.OperationalError, sqlite3.DatabaseError):
+            pass
+        if results:
+            return results
+
+    # Fallback to hybrid_search module
+    if HAS_HYBRID:
+        return hybrid_search(query, top_k, DB_PATH, use_reranker=use_reranker)
+    if HAS_BM25:
+        return bm25_retrieve(query, top_k)
+
+    # Ultimate fallback: LIKE
+    conn = _get_db_connection()
     results = []
     try:
-        rows = conn.execute(
-            """SELECT cc.id, cc.chunk_text, cr.title, sf.source_type, cr.created_at
-               FROM content_chunks cc
-               JOIN content_records cr ON cc.content_record_id = cr.id
-               JOIN source_files sf ON cr.source_file_id = sf.id
-               WHERE cc.chunk_text LIKE ?
-               LIMIT ?""",
-            ("%" + query + "%", top_k)
-        ).fetchall()
-        for r in rows:
-            results.append({
-                "id": r[0], "text": r[1][:500], "title": r[2] or "Untitled",
-                "source": r[3], "created_at": r[4] or "unknown", "score": 0.5,
-            })
-    finally:
-        conn.close()
+        terms = [t for t in query.lower().split() if len(t) > 2]
+        for term in terms[:3]:
+            rows = conn.execute(
+                """SELECT cc.id, cc.chunk_text, cr.title, sf.source_type, cr.created_at
+                   FROM content_chunks cc
+                   JOIN content_records cr ON cc.content_record_id = cr.id
+                   JOIN source_files sf ON cr.source_file_id = sf.id
+                   WHERE cc.chunk_text LIKE ?
+                   LIMIT ?""",
+                ("%" + term + "%", top_k)
+            ).fetchall()
+            for r in rows:
+                results.append({
+                    "id": r[0], "text": r[1][:500], "title": r[2] or "Untitled",
+                    "source": r[3], "created_at": r[4] or "unknown", "score": 0.5,
+                })
+    except Exception:
+        pass
     return results
 
 
@@ -127,7 +217,6 @@ def _build_personal_info():
     if not _personal:
         return ""
 
-    # Detect placeholder values — skip fields with template text
     placeholders = {"your name", "your location", "your timezone", "your gpu", "your ram",
                     "your sbc", "your project", "your project 1", "your project 2",
                     "your ram_system", "your hardware"}
@@ -146,7 +235,6 @@ def _build_personal_info():
             return True
         return val.lower().strip() in placeholders
 
-    # Only include info if real values exist (not placeholders)
     has_real_name = not is_placeholder(name)
     has_real_location = not is_placeholder(location)
 
@@ -185,7 +273,6 @@ def generate_answer(question, context):
 
     personal_info = _build_personal_info()
 
-    # Get display name — skip if it's a placeholder
     name = _personal.get("name", "the user") if _personal else "the user"
     if name.lower().strip() in {"your name", ""}:
         name = "the user"
@@ -220,13 +307,13 @@ def generate_answer(question, context):
         )
 
     payload = json.dumps({
-        "model": "qwen3.5-4b.gguf",
+        "model": "qwen3.5-9b.gguf",
         "messages": [
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_prompt}
         ],
         "temperature": 0.1,
-        "max_tokens": 1024,
+        "max_tokens": 2048,
     }).encode("utf-8")
 
     req = urllib.request.Request(
@@ -324,7 +411,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         t0 = time.perf_counter()
-        passages = retrieve(question, top_k)
+
+        # Use FTS5-only retrieval (no cross-encoder) for speed
+        passages = retrieve(question, top_k, use_reranker=False)
 
         if do_generate and (passages or _personal):
             answer = generate_answer(question, passages)
@@ -342,8 +431,10 @@ class Handler(SimpleHTTPRequestHandler):
         })
 
 
-class Server(HTTPServer):
+class Server(ThreadingMixIn, HTTPServer):
+    """Threaded HTTP server so LLM generation doesn't block other requests."""
     allow_reuse_address = True
+    daemon_threads = True
 
 
 def main():
@@ -351,6 +442,8 @@ def main():
         d.mkdir(parents=True, exist_ok=True)
 
     rec, chk = db_counts()
+    _check_fts5()
+
     print("=" * 50)
     print("LocalBrain - Personal AI Node")
     print("=" * 50)
@@ -358,7 +451,7 @@ def main():
     print(f"  Database:  {DB_PATH}")
     print(f"  Records:   {rec}")
     print(f"  Chunks:    {chk}")
-    print(f"  Retrieval: {'Hybrid (BM25 + reranker)' if HAS_HYBRID else 'BM25'}")
+    print(f"  Retrieval: {'Hybrid (FTS5 BM25)' if _fts5_ready else 'BM25'}")
     print(f"  LLM:       {'Ready' if llm_is_ready() else 'Not loaded'}")
     print(f"  Model:     {get_model_name()}")
     print(f"  Profile:   {'Yes' if _personal else 'No (runtime/personal.json missing)'}")

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-BM25 retriever for RAG - proper term frequency, IDF, and length normalization.
-Caches the index in memory for fast repeated queries.
+BM25 retriever for RAG - uses SQLite FTS5 for fast keyword search.
+No longer loads all chunks into memory; queries FTS5 directly.
+Falls back to in-memory BM25 only if FTS5 is unavailable.
 """
 import sys
 import sqlite3
@@ -28,23 +29,91 @@ STOP_WORDS = {
     'very', 's', 't', 'can', 'will', 'just', 'don', 'should', 'now',
     'el', 'la', 'los', 'las', 'un', 'una', 'de', 'del', 'en', 'y', 'o', 'que', 'por',
     'para', 'con', 'sin', 'se', 'lo', 'mi', 'tu', 'su', 'es', 'son', 'tiene', 'han',
-    'work', 'worked', 'working', 'done', 'know', 'tell', 'get', 'got', 'make', 'made',
-    'see', 'saw', 'say', 'said', 'go', 'went', 'come', 'came', 'think', 'thought',
-    'take', 'took', 'find', 'found', 'give', 'gave', 'use', 'used', 'try', 'tried',
-    'need', 'called', 'call', 'set', 'put', 'want', 'run', 'ran', 'move', 'like',
-    'also', 'back', 'even', 'well', 'way', 'many', 'much', 'into', 'over', 'after',
-    'any', 'thing', 'things', 'stuff', 'project', 'projects', 'something',
 }
 
 def tokenize(text: str) -> list[str]:
     text = text.lower()
-    tokens = re.findall(r'[a-z0-9]{3,}', text)
+    tokens = re.findall(r'[a-z0-9\u00c0-\u024f]{3,}', text)
     return [t for t in tokens if t not in STOP_WORDS]
 
 
+def _fts5_available(db_path: Path) -> bool:
+    """Check if FTS5 table exists and is populated."""
+    if not db_path.exists():
+        return False
+    conn = sqlite3.connect(db_path)
+    try:
+        cnt = conn.execute("SELECT count(*) FROM chunks_fts").fetchone()[0]
+        return cnt > 0
+    except (sqlite3.OperationalError, sqlite3.DatabaseError):
+        return False
+    finally:
+        conn.close()
+
+
+def _search_fts5(db_path: Path, query: str, top_k: int) -> list[dict]:
+    """Fast FTS5 keyword search on chunk_text."""
+    if not db_path.exists():
+        return []
+
+    conn = sqlite3.connect(db_path)
+    results = []
+    try:
+        terms = tokenize(query)
+        if not terms:
+            terms = query.lower().split()[:10]
+
+        fts_query = " OR ".join(terms)
+
+        rows = conn.execute(
+            """SELECT rowid, chunk_text, title, source_type, content_record_id
+               FROM chunks_fts
+               WHERE chunks_fts MATCH ?
+               ORDER BY rank
+               LIMIT ?""",
+            (fts_query, top_k),
+        ).fetchall()
+
+        # Batch fetch created_at
+        record_ids = [r[4] for r in rows if r[4]]
+        created_at_map = {}
+        if record_ids:
+            placeholders = ",".join("?" * len(record_ids))
+            for row2 in conn.execute(
+                f"SELECT id, created_at FROM content_records WHERE id IN ({placeholders})",
+                record_ids
+            ):
+                created_at_map[row2[0]] = row2[1]
+
+        for row in rows:
+            chunk_id, text, title, source, record_id = row
+            created_at = created_at_map.get(record_id)
+            score = 0.0
+            text_lower = text.lower() if text else ""
+            for t in terms:
+                count = text_lower.count(t)
+                score += min(count * 0.5, 2.0)
+            score += len([t for t in terms if t in text_lower]) * 1.0
+
+            results.append({
+                'id': chunk_id,
+                'text': (text or "")[:500],
+                'title': title or 'Untitled',
+                'source': source or 'unknown',
+                'created_at': str(created_at) if created_at else 'unknown',
+                'score': round(score, 3),
+            })
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        conn.close()
+
+    return results
+
+
 class BM25Retriever:
-    """BM25 retriever with in-memory inverted index."""
-    
+    """BM25 retriever with in-memory inverted index (fallback only)."""
+
     def __init__(self, db_path: Path = DB_PATH):
         self.k1 = 1.5
         self.b = 0.75
@@ -52,23 +121,25 @@ class BM25Retriever:
         self.N = 0
         self.idf = {}
         self.documents = []
-        self._build_index(db_path)
-    
-    def _build_index(self, db_path: Path):
-        if not db_path.exists():
+        self.db_path = db_path
+
+    def _build_index(self):
+        """Build in-memory index only as fallback when FTS5 is unavailable."""
+        if not self.db_path.exists():
             return
-        
-        conn = sqlite3.connect(db_path)
+
+        conn = sqlite3.connect(self.db_path)
         try:
             rows = conn.execute(
                 """SELECT cc.id, cc.chunk_text, cr.title, sf.source_type, cr.created_at
                    FROM content_chunks cc
                    JOIN content_records cr ON cc.content_record_id = cr.id
-                   JOIN source_files sf ON cr.source_file_id = sf.id"""
+                   JOIN source_files sf ON cr.source_file_id = sf.id
+                   LIMIT 50000"""
             ).fetchall()
         finally:
             conn.close()
-        
+
         for row in rows:
             chunk_id, text, title, source, created_at = row
             if not text or len(text) < 20:
@@ -84,12 +155,11 @@ class BM25Retriever:
                 'created_at': created_at or 'unknown',
                 'tokens': tokens,
             })
-        
+
         self.N = len(self.documents)
         if self.N == 0:
             return
-        
-        # Compute document frequency
+
         term_doc_freq = {}
         total_tokens = 0
         for doc in self.documents:
@@ -99,26 +169,22 @@ class BM25Retriever:
                 if t not in seen:
                     term_doc_freq[t] = term_doc_freq.get(t, 0) + 1
                     seen.add(t)
-        
+
         self.avg_doc_len = total_tokens / self.N
-        
-        # IDF: log((N - df + 0.5) / (df + 0.5) + 1)
+
         for term, df in term_doc_freq.items():
             self.idf[term] = math.log((self.N - df + 0.5) / (df + 0.5) + 1.0)
-    
+
     def search(self, query: str, top_k: int = 5) -> list[dict]:
         if self.N == 0:
             return []
-        
-        # Expand query with related terms
+
         expanded = expand_query(query)
         query_tokens = tokenize(expanded)
         if not query_tokens:
             return []
-        
-        # Also parse original query for tool/task matching
+
         orig_tokens = tokenize(query)
-        
         scores = []
         for doc in self.documents:
             score = 0.0
@@ -126,8 +192,7 @@ class BM25Retriever:
             doc_term_freq = {}
             for t in doc['tokens']:
                 doc_term_freq[t] = doc_term_freq.get(t, 0) + 1
-            
-            # BM25 scoring on expanded query
+
             for qt in query_tokens:
                 if qt not in doc_term_freq:
                     continue
@@ -138,17 +203,16 @@ class BM25Retriever:
                 num = tf * (self.k1 + 1)
                 denom = tf + self.k1 * (1 - self.b + self.b * doc_len / self.avg_doc_len)
                 score += idf * num / denom
-            
-            # Bonus for matching original query tokens more strongly
+
             for qt in orig_tokens:
                 if qt in doc_term_freq:
-                    score += 2.0  # Bonus for exact match
-            
+                    score += 2.0
+
             if score > 0:
                 scores.append((score, doc))
-        
+
         scores.sort(key=lambda x: x[0], reverse=True)
-        
+
         results = []
         for score, doc in scores[:top_k]:
             results.append({
@@ -159,7 +223,7 @@ class BM25Retriever:
                 'created_at': doc['created_at'],
                 'score': round(score, 3),
             })
-        
+
         return results
 
 
@@ -167,21 +231,32 @@ class BM25Retriever:
 _retriever = None
 _retriever_lock = Lock()
 
-def get_retriever(db_path: Path = DB_PATH) -> BM25Retriever:
+def get_retriever(db_path: Path = DB_PATH):
     """Get or create the cached BM25 retriever."""
     global _retriever
     with _retriever_lock:
         if _retriever is None:
             _retriever = BM25Retriever(db_path)
+            # Only build in-memory index if FTS5 is not available
+            if not _fts5_available(db_path):
+                _retriever._build_index()
         return _retriever
 
+
 def retrieve_chunks(query: str, limit: int = 5, db_path: Path = DB_PATH) -> list[dict]:
-    """Public API - retrieve chunks using cached BM25 index."""
+    """Public API - retrieve chunks using FTS5 (preferred) or in-memory BM25."""
+    # Always try FTS5 first - it's fast and doesn't load everything into memory
+    if _fts5_available(db_path):
+        results = _search_fts5(db_path, query, limit)
+        if results:
+            return results
+
+    # Fallback to in-memory BM25
     retriever = get_retriever(db_path)
     return retriever.search(query, limit)
 
 
-# Query expansion patterns for common questions
+# Query expansion patterns
 QUERY_EXPANSIONS = {
     "age": ["birth", "born", "year", "old"],
     "project": ["repo", "github", "code", "app", "bot", "service"],

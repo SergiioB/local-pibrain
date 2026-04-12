@@ -3,6 +3,15 @@ function escapeHtml(t) {
   return t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
+function renderMarkdown(text) {
+  if (typeof markdownit !== "undefined") {
+    var md = markdownit({ html: false, linkify: true, typographer: false, breaks: true });
+    return md.render(text || "");
+  }
+  // Fallback: escape HTML
+  return escapeHtml(text || "");
+}
+
 async function loadStatus() {
   try {
     var r = await fetch("/api/status");
@@ -82,7 +91,7 @@ async function ask() {
     }
 
     var data = await res.json();
-    aEl.textContent = data.answer + " (" + data.elapsed_ms + "ms)";
+    aEl.innerHTML = renderMarkdown(data.answer) + " <span class=\"small\">(" + data.elapsed_ms + "ms)</span>";
 
     if (data.passages && data.passages.length > 0) {
       var h = "";
