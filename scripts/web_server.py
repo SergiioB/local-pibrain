@@ -123,8 +123,15 @@ def retrieve(query, top_k):
 
 
 def _build_personal_info():
+    """Build personal profile info, skipping placeholder values."""
     if not _personal:
         return ""
+
+    # Detect placeholder values — skip fields with template text
+    placeholders = {"your name", "your location", "your timezone", "your gpu", "your ram",
+                    "your sbc", "your project", "your project 1", "your project 2",
+                    "your ram_system", "your hardware"}
+
     lines = []
     name = _personal.get("name", "")
     location = _personal.get("location", "")
@@ -133,24 +140,42 @@ def _build_personal_info():
     tools = _personal.get("tools_used", [])
     projects = _personal.get("projects", [])
     interests = _personal.get("interests", [])
-    notes = _personal.get("notes", "")
-    if name:
+
+    def is_placeholder(val):
+        if not val:
+            return True
+        return val.lower().strip() in placeholders
+
+    # Only include info if real values exist (not placeholders)
+    has_real_name = not is_placeholder(name)
+    has_real_location = not is_placeholder(location)
+
+    if has_real_name:
         lines.append(f"- Name: {name}")
-    if location:
+    if has_real_location:
         lines.append(f"- Location: {location}")
-    if timezone:
+    if timezone and not is_placeholder(timezone):
         lines.append(f"- Timezone: {timezone}")
-    if interests:
-        lines.append(f"- Interests: {', '.join(interests)}")
-    if hardware:
-        parts = [f"{k}: {v}" for k, v in hardware.items()]
-        lines.append(f"- Hardware: {'; '.join(parts)}")
-    if tools:
-        lines.append(f"- AI Tools Used: {', '.join(tools)}")
-    if projects:
-        lines.append(f"- Projects: {', '.join(projects)}")
-    if notes:
-        lines.append(f"- Notes: {notes}")
+    if interests and not all(is_placeholder(i) for i in interests):
+        real_interests = [i for i in interests if not is_placeholder(i)]
+        if real_interests:
+            lines.append(f"- Interests: {', '.join(real_interests)}")
+    if hardware and not all(is_placeholder(v) for v in hardware.values()):
+        parts = [f"{k}: {v}" for k, v in hardware.items() if not is_placeholder(v)]
+        if parts:
+            lines.append(f"- Hardware: {'; '.join(parts)}")
+    if tools and not all(is_placeholder(t) for t in tools):
+        real_tools = [t for t in tools if not is_placeholder(t)]
+        if real_tools:
+            lines.append(f"- AI Tools Used: {', '.join(real_tools)}")
+    if projects and not all(is_placeholder(p) for p in projects):
+        real_projects = [p for p in projects if not is_placeholder(p)]
+        if real_projects:
+            lines.append(f"- Projects: {', '.join(real_projects)}")
+
+    if not lines:
+        return ""
+
     return "\n".join(lines)
 
 
@@ -159,7 +184,11 @@ def generate_answer(question, context):
         return "llama-server not running. Start: llama-server -m models/qwen3.5-4b.gguf --port 8080 -ngl 99"
 
     personal_info = _build_personal_info()
+
+    # Get display name — skip if it's a placeholder
     name = _personal.get("name", "the user") if _personal else "the user"
+    if name.lower().strip() in {"your name", ""}:
+        name = "the user"
 
     sys_prompt = (
         f"You are LocalBrain, {name}'s private local AI assistant.\n"

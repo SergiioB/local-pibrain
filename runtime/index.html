@@ -24,10 +24,10 @@
     <textarea id="question" placeholder="What have I discussed about fan control on Rock 5B?"></textarea>
     <div class="controls">
       <label class="toggle"><input type="checkbox" id="genAnswer" checked><span>Generate answer with LLM</span></label>
-      <label>Top K <input type="number" id="topK" value="5" min="1" max="20" style="width:60px"></label>
+      <label>Top K <input type="number" id="topK" value="5" min="1" max="20" style="width:60px" title="Number of passages to retrieve. Higher = more context but slower."></label>
       <button id="askBtn">Ask</button>
     </div>
-    <div class="output" id="answer">Ask a question to search your knowledge base.</div>
+    <div class="output" id="answer">Ask a question about your data. Ctrl+Enter to submit.</div>
     <div class="output" id="passages">Passages will appear here.</div>
   </section>
 
