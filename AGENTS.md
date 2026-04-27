@@ -19,7 +19,7 @@ All local, all private.
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                    LOCALBRAIN                        │
+│                    LOCALBRAIN v2                     │
 ├─────────────────────────────────────────────────────┤
 │  DATA SOURCES                                       │
 │    Pi sessions         ~/.pi/agent/sessions/        │
@@ -34,6 +34,8 @@ All local, all private.
 │         ▼                                           │
 │  INGESTION PIPELINE                                 │
 │    discover → classify → extract → chunk → embed    │
+│    (smart chunking: auto/fixed/sliding/recursive/    │
+│     semantic/conversation-aware)                    │
 │         │                                           │
 │         ▼                                           │
 │  SQLite + sqlite-vec (embeddings)                   │
@@ -41,10 +43,23 @@ All local, all private.
 │         │                                           │
 │    ┌────┴────┐                                      │
 │    ▼         ▼                                      │
-│  LOCAL LLM   OUTPUTS                                │
-│  llama.cpp   • Web UI (chat interface)              │
-│  (any GPU)   • Morning Briefing                     │
-│              • arXiv Queue                          │
+│  RETRIEVAL   OUTPUTS                                │
+│  ┌─────────┐ • Web UI (chat interface)              │
+│  │Query    │ • Morning Briefing                     │
+│  │Planner  │ • arXiv Queue                          │
+│  └────┬────┘ • Quality Metrics                      │
+│       ▼                                             │
+│  Hybrid Retrieval:                                  │
+│   1. BM25 (FTS5) → broad keyword recall            │
+│   2. Vector (sqlite-vec) → semantic similarity      │
+│   3. Merge + deduplicate                            │
+│   4. Cross-encoder rerank (optional)                │
+│   5. Recency + importance scoring                   │
+│       ▼                                             │
+│  LOCAL LLM (llama.cpp, any GPU)                     │
+│  - Adapts prompt to query type                     │
+│  - Comparative queries get more context             │
+│  - Quality-tracked responses                        │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -59,15 +74,28 @@ python scripts/ops/init_db.py
 python scripts/ingest/discover.py
 python scripts/ingest/classify.py
 python scripts/ingest/extract.py
-python scripts/ingest/chunk.py
-python scripts/ingest/embedding.py
+python scripts/ingest/chunk.py          # Smart chunking (auto strategy)
+python scripts/ingest/embedding.py     # Real sentence-transformer embeddings
 
-# Start web UI (chat interface)
+# Start web UI (chat interface with query planning)
 python scripts/web_server.py
 
 # Query knowledge base
 python scripts/query.py "search term" --db data/state.db
 python scripts/query.py --recent 7 --db data/state.db
+
+# Hybrid retrieval (direct)
+python scripts/core/retriever.py "search term" --strategy auto --rerank
+
+# Query planning (analyze optimal strategy)
+python scripts/core/query_planner.py "what hardware do I have?"
+
+# Quality metrics
+python scripts/core/quality.py --report --index-stats
+python scripts/core/quality.py --failures
+
+# Smart chunking (test strategies)
+python scripts/core/smart_chunk.py --strategy auto --text "your text here"
 ```
 
 ### Data Source Setup
@@ -130,8 +158,16 @@ localbrain/
 ├── data/             # SQLite database, logs, manifests
 ├── exports/          # Raw data sources (takeout ZIPs, JSONL)
 ├── prompts/          # LLM prompt templates
+├── schemas/          # SQL schema definitions
 ├── scripts/          # Python pipeline scripts
-│   ├── core/         # Shared utilities (llm_client, paths, bm25)
+│   ├── core/         # Shared utilities
+│   │   ├── retriever.py      # Hybrid retrieval (BM25 + Vector + Rerank)
+│   │   ├── query_planner.py  # Auto-selects best retrieval strategy
+│   │   ├── smart_chunk.py    # Strategy-aware chunking
+│   │   ├── quality.py        # Retrieval quality metrics
+│   │   ├── hybrid_search.py  # Legacy hybrid search
+│   │   ├── bm25.py           # BM25/FTS5 search
+│   │   └── llm_client.py     # LLM client
 │   ├── ingest/       # Ingestion pipeline
 │   └── ops/          # Database operations
 ├── runtime/          # Web UI (index.html, app.js, style.css)
@@ -147,16 +183,60 @@ localbrain/
 4. **Workflow automation** - Briefings, arXiv triage
 5. **Open source** - Ship to GitHub as usable MVP
 
+## Retrieval Architecture (v2)
+
+Based on analysis of RAG vs Long Context approaches:
+
+### Query Planning
+Queries are auto-classified into types, each with optimal retrieval:
+
+| Query Type | Strategy | Why |
+|------------|----------|-----|
+| Factual | BM25 only | Keywords are precise |
+| Comparative | Long context | Solves "whole book problem" |
+| Analytical | Hybrid + rerank | Needs broad context with precision |
+| Temporal | Hybrid + recency | Fresh results matter |
+| Personal | Hybrid | May be in profile or knowledge base |
+| Code | BM25 only | Code has specific keywords |
+| Exploratory | Hybrid | Broad search with semantic recall |
+
+### Retrieval Pipeline
+1. **BM25 (FTS5)** → fast keyword candidates (broad recall)
+2. **Vector search (sqlite-vec)** → semantic similarity
+3. **Merge + deduplicate** → combine both signals, boost mutual hits
+4. **Cross-encoder rerank** → precision boost (optional)
+5. **Recency + importance** → final scoring
+
+### Smart Chunking
+Auto-selects strategy based on content type:
+- **Conversations** → turn-aware (groups complete speaker turns)
+- **Markdown/docs** → semantic (groups by headings/paragraphs)
+- **Code** → fixed-size (predictable boundaries)
+- **General text** → recursive (respects paragraph → sentence → char)
+- **Sliding window** → overlap for context continuity
+
+### Quality Metrics
+Tracks retrieval performance to detect:
+- Zero-result queries (retrieval failures)
+- Low-confidence results (potential silent failures)
+- Latency outliers
+- Source diversity
+
 ## What Makes This Unique
 
-| Feature | LocalBrain | RAGFlow | Others |
-|---------|------------|---------|--------|
+| Feature | LocalBrain v2 | RAGFlow | Others |
+|---------|---------------|---------|--------|
 | AI conversation extraction | Yes (pi-brain) | No | No |
 | Privacy redaction | Yes (built-in) | Partial | Varies |
 | No Docker required | Yes | No | Varies |
 | Multi-platform | Yes (GPU + CPU) | Optional | Varies |
 | Open source | Yes | Yes | Varies |
 | SQLite-only | Yes | ES/MySQL | Varies |
+| Query planning | Yes | No | Rare |
+| Smart chunking | Yes (5 strategies) | Basic | Basic |
+| Hybrid retrieval | BM25+Vector+Rerank | Varies | Varies |
+| Quality tracking | Yes | No | No |
+| Silent failure detection | Yes | No | No |
 
 ## Rules
 

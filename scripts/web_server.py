@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-LocalBrain - Web server with hybrid RAG + LLM.
-FTS5-powered retrieval + optional cross-encoder reranking. Threaded server.
+LocalBrain - Web server with intelligent hybrid RAG + LLM.
+
+Improvements from "Is RAG Still Needed?" analysis:
+  1. Query planning: auto-selects best retrieval strategy per query
+  2. Hybrid retrieval: BM25 + vector + cross-encoder reranking
+  3. Quality tracking: monitors retrieval performance
+  4. Context management: adapts context size to query type
+  5. Better UI: shows strategy, scores, provenance
 """
 import json
 import os
@@ -33,27 +39,25 @@ if PERSONAL_PATH.exists():
     except Exception:
         pass
 
-# --- Hybrid Search (FTS5 BM25 + optional cross-encoder reranking) ---
-try:
-    from core.hybrid_search import search as hybrid_search
-    HAS_HYBRID = True
-except ImportError:
-    HAS_HYBRID = False
-
-# --- BM25 fallback ---
-try:
-    from core.bm25 import retrieve_chunks as bm25_retrieve
-    HAS_BM25 = True
-except ImportError:
-    HAS_BM25 = False
+# --- Hybrid Retrieval ---
+from core.retriever import hybrid_retrieve, RetrievalResult
+from core.query_planner import plan_query, QueryType
+from core.quality import QualityTracker, RetrievalMetric, compute_index_stats
 
 # --- LLM ---
 LLAMA_URL = os.environ.get("LLAMA_SERVER_URL", "http://127.0.0.1:8080")
 
-# --- Connection pool (simple per-thread reuse) ---
+# --- Quality tracker ---
+_quality = QualityTracker(DB_PATH)
+
+# --- Cached status (refreshed periodically) ---
+_status_cache = {"data": None, "last_updated": 0}
+_STATUS_CACHE_TTL = 30  # seconds
+
+# --- Connection pool ---
 import threading
 _thread_local = threading.local()
-_fts5_ready = None  # Global flag, set at startup
+
 
 def _get_db_connection():
     """Get or create a thread-local database connection."""
@@ -61,41 +65,21 @@ def _get_db_connection():
         _thread_local.db_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         _thread_local.db_conn.row_factory = None
         _thread_local.db_conn.execute("PRAGMA journal_mode=WAL")
-        _thread_local.db_conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
+        _thread_local.db_conn.execute("PRAGMA cache_size=-64000")
         _thread_local.db_conn.execute("PRAGMA temp_store=MEMORY")
     return _thread_local.db_conn
 
 
-def _check_fts5():
-    """Check FTS5 availability once at startup."""
-    global _fts5_ready
-    if _fts5_ready is not None:
-        return _fts5_ready
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cnt = conn.execute("SELECT count(*) FROM chunks_fts").fetchone()[0]
-        _fts5_ready = cnt > 0
-        conn.close()
-        if _fts5_ready:
-            print(f"  FTS5 index ready ({cnt} entries)")
-        else:
-            print("  FTS5 index not found, falling back to in-memory BM25")
-    except Exception:
-        _fts5_ready = False
-        print("  FTS5 unavailable, falling back to in-memory BM25")
-    return _fts5_ready
-
-
 def _llama_health():
     try:
-        r = urllib.request.urlopen(LLAMA_URL + "/health", timeout=3)
+        r = urllib.request.urlopen(LLAMA_URL + "/health", timeout=1)
         return r.status == 200
     except Exception:
         return False
 
 def _llama_model():
     try:
-        r = urllib.request.urlopen(LLAMA_URL + "/v1/models", timeout=3)
+        r = urllib.request.urlopen(LLAMA_URL + "/v1/models", timeout=1)
         d = json.loads(r.read().decode())
         models = d.get("models", d.get("data", []))
         if models:
@@ -129,300 +113,11 @@ def db_counts():
         conn.close()
 
 
-def _normalize_query(query: str) -> str:
-    """Normalize query: lowercase, remove accents, strip punctuation."""
-    import unicodedata
-    import re
-    text = unicodedata.normalize("NFKD", query.lower())
-    text = text.encode("ascii", "ignore").decode("ascii")
-    # Strip all punctuation and special characters
-    text = re.sub(r'[^\w\s]', ' ', text)
-    return text.strip()
-
-
-# Query expansion map for common tech terms
-_QUERY_EXPANSIONS = {
-    "docker": "container podman deploy kubernetes",
-    "container": "docker podman deploy kubernetes",
-    "gpu": "nvidia cuda vram graphics",
-    "hardware": "cpu ram gpu device machine",
-    "database": "sqlite db postgres mysql",
-    "server": "api http backend service",
-    "deploy": "docker container production release",
-    "config": "configuration settings setup options",
-    "network": "dns routing proxy ip address",
-    "fan": "cooling thermal temperature pwm heat",
-    "android": "app mobile kotlin java gradle",
-    "ai": "llm model inference embedding llamacpp",
-    "tool": "cli utility script command",
-    "project": "repo codebase application repository proyecto app bot sistema",
-    "proyecto": "project app bot sistema desarrollo codigo",
-    "work": "task build implement fix feature code",
-    "disk": "storage ssd hdd sdcard mount disco duro",
-    "memory": "ram swap memoria",
-    "que": "que cual cuales",
-    "como": "how configurar setup configure",
-    "cual": "which what cual",
-}
-
-
-def _expand_query(query: str) -> list[str]:
-    """Expand query with related terms for better recall.
-    Returns list of query variants to try."""
-    queries = [query]
-    terms = _normalize_query(query).split()
-
-    # Add expanded variant
-    expanded_terms = []
-    for t in terms:
-        if len(t) >= 3:
-            expanded_terms.append(t)
-            if t in _QUERY_EXPANSIONS:
-                expanded_terms.extend(_QUERY_EXPANSIONS[t].split())
-    if expanded_terms != terms:
-        queries.append(" ".join(expanded_terms))
-
-    return queries
-
-
-def _format_timestamp(ts) -> str:
-    """Format timestamp to human-readable date."""
-    if not ts:
-        return "unknown"
-    ts_str = str(ts)
-    # Epoch milliseconds (13 digits)
-    if len(ts_str) == 13 and ts_str.isdigit():
-        from datetime import datetime
-        try:
-            return datetime.utcfromtimestamp(int(ts_str) / 1000).strftime("%Y-%m-%d")
-        except Exception:
-            pass
-    # ISO format
-    if "T" in ts_str:
-        return ts_str[:10]
-    return ts_str[:10]
-
-
-def _recency_weight(created_at, decay_days=365):
-    """Exponential recency decay: newer items get higher weight.
-    Weight ranges from 1.0 (today) to ~0.37 (1 year old)."""
-    if not created_at:
-        return 0.5
-    from datetime import datetime, timezone
-    ts_str = str(created_at)
-    try:
-        if len(ts_str) == 13 and ts_str.isdigit():
-            dt = datetime.utcfromtimestamp(int(ts_str) / 1000)
-        elif "T" in ts_str:
-            dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-            if dt.tzinfo:
-                dt = dt.replace(tzinfo=None)
-        else:
-            dt = datetime.fromisoformat(ts_str[:10])
-        days_old = (datetime.now() - dt).days
-        if days_old < 0:
-            days_old = 0
-        import math
-        return math.exp(-days_old / decay_days)
-    except Exception:
-        return 0.5
-
-
-def retrieve(query, top_k, use_reranker=False):
-    """Retrieve using FTS5-powered search with query expansion,
-    recency weighting, and metadata boosting."""
-    if not DB_PATH.exists():
-        return []
-
-    if _fts5_ready:
-        conn = _get_db_connection()
-        all_results = {}  # keyed by chunk_id for dedup
-
-        try:
-            # Try original query + expanded variants
-            query_variants = _expand_query(query)
-
-            for variant_idx, variant in enumerate(query_variants):
-                terms = [t for t in _normalize_query(variant).split() if len(t) > 2]
-                if not terms:
-                    continue
-
-                # FTS5 query
-                fts_query = " OR ".join(terms)
-                candidate_limit = max(top_k * 4, 20)
-
-                rows = conn.execute(
-                    """SELECT rowid, chunk_text, title, source_type, content_record_id, created_at
-                       FROM chunks_fts
-                       WHERE chunks_fts MATCH ?
-                       ORDER BY rank
-                       LIMIT ?""",
-                    (fts_query, candidate_limit),
-                ).fetchall()
-
-                if not rows:
-                    continue
-
-                # Batch fetch metadata
-                record_ids = list(set(r[4] for r in rows if r[4]))
-                metadata_map = {}
-                if record_ids:
-                    placeholders = ",".join("?" * len(record_ids))
-                    for row2 in conn.execute(
-                        f"""SELECT cr.id, cr.created_at, cr.importance_score,
-                                   cr.title as record_title, sf.source_type
-                            FROM content_records cr
-                            JOIN source_files sf ON cr.source_file_id = sf.id
-                            WHERE cr.id IN ({placeholders})""",
-                        record_ids
-                    ):
-                        metadata_map[row2[0]] = {
-                            'created_at': row2[1],
-                            'importance': row2[2] or 0.5,
-                            'record_title': row2[3],
-                            'source_type': row2[4],
-                        }
-
-                for r in rows:
-                    chunk_id, text, title, source, record_id, ft_created = r
-                    if chunk_id in all_results:
-                        continue
-
-                    meta = metadata_map.get(record_id, {})
-                    created_at = meta.get('created_at') or ft_created
-
-                    # --- Composite scoring ---
-                    text_lower = (text or "").lower()
-                    title_lower = (title or "").lower()
-
-                    # 1. Term match ratio: how many query terms actually appear in chunk
-                    matched_terms = [t for t in terms if t in text_lower]
-                    match_ratio = len(matched_terms) / max(len(terms), 1)
-
-                    # 2. Term density: total matches vs text length (penalize long noise)
-                    total_matches = sum(text_lower.count(t) for t in matched_terms)
-                    text_len = max(len(text_lower.split()), 1)
-                    term_density = total_matches / text_len * 100  # per 100 words
-
-                    # 3. Title signal: does the title contain query terms?
-                    title_matches = sum(1 for t in terms if t in title_lower)
-                    title_score = title_matches / max(len(terms), 1)
-
-                    # 4. Title quality: meaningful titles get bonus
-                    title_quality = 1.0
-                    generic_titles = {"untitled", "", "conversation title: title generation request",
-                                      "miactividad.html", "adjuntaste"}
-                    if title_lower.strip() in generic_titles:
-                        title_quality = 0.3
-                    elif title_quality > 0.3 and len(title) > 15:
-                        title_quality = 1.3
-
-                    # 5. Personal context signal: does the chunk sound like
-                    # the user's own setup (first-person, confirmation) vs shopping list?
-                    personal_indicators = [
-                        'i have', 'my ', 'tengo', 'mi ', 'compre', 'compré',
-                        'bought', 'i own', 'i use', 'i run', 'i set up',
-                        'configured', 'installed', 'currently using',
-                        'actualmente', 'en mi ', 'configuré', 'configuro',
-                    ]
-                    personal_score = sum(1 for ind in personal_indicators if ind in text_lower)
-                    personal_signal = min(personal_score / 3.0, 1.0)  # capped at 1.0
-
-                    # Shopping/research noise penalty
-                    shopping_indicators = [
-                        'comparar', '€', 'opiniones', 'envío gratis', 'entrega',
-                        'specifications', 'techpowerup', 'datab', 'choose between',
-                        'which laptop', 'qué portátil', 'mejores ofertas',
-                    ]
-                    shopping_score = sum(1 for ind in shopping_indicators if ind in text_lower)
-                    shopping_penalty = min(shopping_score * 0.3, 1.0)  # up to -1.0
-
-                    # 6. Recency
-                    recency = _recency_weight(created_at)
-
-                    # 7. Importance from metadata
-                    importance = meta.get('importance', 0.5)
-
-                    # 8. Variant bonus: original query matches score higher than expanded
-                    variant_bonus = 1.0 if variant_idx == 0 else 0.8
-
-                    # Final composite score
-                    score = (
-                        match_ratio * 4.0 +           # Core: how many terms matched (0-4)
-                        min(term_density, 5.0) * 0.6 +  # Term density, capped (0-3)
-                        title_score * 3.0 +            # Title match signal (0-3)
-                        title_quality * 1.5 +           # Title quality (0.45-1.95)
-                        personal_signal * 2.0 +         # Personal context bonus (0-2)
-                        -shopping_penalty * 1.5 +       # Shopping list penalty (-1.5 to 0)
-                        recency * 1.2 +                 # Freshness (0.37-1.2)
-                        importance * 0.8 +              # Pre-computed importance (0-0.8)
-                        variant_bonus                   # Original query bonus
-                    )
-
-                    all_results[chunk_id] = {
-                        "id": chunk_id,
-                        "text": (text or "")[:500],
-                        "title": title or (meta.get('record_title') or "Untitled"),
-                        "source": source or meta.get('source_type') or "unknown",
-                        "created_at": _format_timestamp(created_at),
-                        "score": round(score, 3),
-                    }
-
-        except (sqlite3.OperationalError, sqlite3.DatabaseError):
-            pass
-
-        # Sort by composite score and return top_k
-        results = sorted(all_results.values(), key=lambda x: x["score"], reverse=True)
-        return results[:top_k]
-
-    # Fallback to hybrid_search module
-    if HAS_HYBRID:
-        return hybrid_search(query, top_k, DB_PATH, use_reranker=use_reranker)
-    if HAS_BM25:
-        return bm25_retrieve(query, top_k)
-
-    # Ultimate fallback: LIKE
-    conn = _get_db_connection()
-    results = []
-    try:
-        terms = [t for t in query.lower().split() if len(t) > 2]
-        for term in terms[:3]:
-            rows = conn.execute(
-                """SELECT cc.id, cc.chunk_text, cr.title, sf.source_type, cr.created_at
-                   FROM content_chunks cc
-                   JOIN content_records cr ON cc.content_record_id = cr.id
-                   JOIN source_files sf ON cr.source_file_id = sf.id
-                   WHERE cc.chunk_text LIKE ?
-                   LIMIT ?""",
-                ("%" + term + "%", top_k)
-            ).fetchall()
-            for r in rows:
-                results.append({
-                    "id": r[0], "text": r[1][:500], "title": r[2] or "Untitled",
-                    "source": r[3], "created_at": r[4] or "unknown", "score": 0.5,
-                })
-    except Exception:
-        pass
-    return results
-
-
-def _get_retrieval_method():
-    """Return which retrieval method is active."""
-    if _fts5_ready:
-        return "fts5_direct"
-    if HAS_HYBRID:
-        return "hybrid_search"
-    if HAS_BM25:
-        return "bm25"
-    return "keyword_like"
-
-
 def _build_personal_info():
     """Build personal profile info, skipping placeholder values."""
     if not _personal:
         return ""
 
-    # Detect placeholder values — skip fields with template text
     placeholders = {"your name", "your location", "your timezone", "your gpu", "your ram",
                     "your sbc", "your project", "your project 1", "your project 2",
                     "your ram_system", "your hardware"}
@@ -441,13 +136,9 @@ def _build_personal_info():
             return True
         return val.lower().strip() in placeholders
 
-    # Only include info if real values exist (not placeholders)
-    has_real_name = not is_placeholder(name)
-    has_real_location = not is_placeholder(location)
-
-    if has_real_name:
+    if not is_placeholder(name):
         lines.append(f"- Name: {name}")
-    if has_real_location:
+    if not is_placeholder(location):
         lines.append(f"- Location: {location}")
     if timezone and not is_placeholder(timezone):
         lines.append(f"- Timezone: {timezone}")
@@ -472,13 +163,14 @@ def _build_personal_info():
         if real_projects:
             lines.append(f"- Projects: {', '.join(real_projects)}")
 
-    if not lines:
-        return ""
-
-    return "\n".join(lines)
+    return "\n".join(lines) if lines else ""
 
 
-def generate_answer(question, context):
+def generate_answer(question, context, query_plan=None):
+    """Generate answer using LLM with retrieved context.
+
+    Adapts the system prompt based on query type from the planner.
+    """
     if not _llama_health():
         return "llama-server not running. Start: llama-server -m models/qwen3.5-4b.gguf --port 8080 -ngl 99"
 
@@ -488,12 +180,27 @@ def generate_answer(question, context):
     if name.lower().strip() in {"your name", ""}:
         name = "the user"
 
+    # Adapt system prompt based on query type
     sys_prompt = (
         f"You are LocalBrain, {name}'s private local AI assistant.\n"
         f"You answer questions about {name}'s personal knowledge base.\n\n"
     )
     if personal_info:
         sys_prompt += f"ABOUT {name.upper()} (use this for personal questions):\n{personal_info}\n\n"
+
+    # Type-specific instructions
+    if query_plan and query_plan.query_type == QueryType.COMPARATIVE:
+        sys_prompt += (
+            "The user is asking a comparative question. You have multiple documents in context. "
+            "Compare them carefully and identify differences, gaps, or missing elements. "
+            "Reference specific passages when making comparisons.\n\n"
+        )
+    elif query_plan and query_plan.query_type == QueryType.ANALYTICAL:
+        sys_prompt += (
+            "The user wants an analytical answer. Synthesize information from multiple passages. "
+            "Provide insights and patterns you observe across the retrieved context.\n\n"
+        )
+
     sys_prompt += (
         "RULES:\n"
         "1. If the question asks about personal info (name, location, hardware, tools, projects, interests), "
@@ -503,14 +210,21 @@ def generate_answer(question, context):
         "summarize what you find. Don't just say 'I don't have info' if there are relevant passages.\n"
         "4. If the context truly doesn't contain relevant information, say: "
         "'I don't have specific information about that in your knowledge base, but based on what I know...'\n"
-        "5. Be concise and helpful. Cite sources when possible."
+        "5. Be concise and helpful. Cite passage numbers when possible.\n"
+        "6. If you see a score or confidence indicator, prefer higher-scored passages."
     )
 
     if context:
-        ctx = "\n\n".join([c["text"][:500] for c in context[:5]])
+        ctx_parts = []
+        for i, c in enumerate(context[:8], 1):
+            score_info = f" (relevance: {c.score:.1f})" if hasattr(c, 'score') and c.score else ""
+            text = c.text[:500] if hasattr(c, 'text') else str(c.get("text", ""))[:500]
+            source = c.source if hasattr(c, 'source') else c.get("source", "unknown")
+            ctx_parts.append(f"[Passage {i}{score_info}, source: {source}]\n{text}")
+
         user_prompt = (
-            f"Context from knowledge base:\n{ctx}\n\n"
-            f"Question: {question}\n\n"
+            f"Context from knowledge base:\n\n" + "\n\n".join(ctx_parts) +
+            f"\n\nQuestion: {question}\n\n"
             f"Answer based on the ABOUT section and context above:"
         )
     else:
@@ -573,16 +287,32 @@ def recent_activities(limit=10):
         conn.close()
 
 
+def _format_timestamp(ts) -> str:
+    if not ts:
+        return "unknown"
+    ts_str = str(ts)
+    if len(ts_str) == 13 and ts_str.isdigit():
+        from datetime import datetime
+        try:
+            return datetime.utcfromtimestamp(int(ts_str) / 1000).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    if "T" in ts_str:
+        return ts_str[:10]
+    return ts_str[:10]
+
+
 # --- HTTP Handler ---
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(RUNTIME_DIR), **kwargs)
 
     def log_message(self, fmt, *args):
-        pass
+        # Log to stderr for debugging
+        sys.stderr.write(f"[HTTP] {fmt % args}\n")
 
     def _json(self, data, status=200):
-        body = json.dumps(data, indent=2).encode("utf-8")
+        body = json.dumps(data, indent=2, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -591,24 +321,49 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/api/status":
+            import time as _time
+            now = _time.time()
+            cached = _status_cache.get("data")
+            if cached and (now - _status_cache["last_updated"]) < _STATUS_CACHE_TTL:
+                self._json(cached)
+                return
+
             rec, chk = db_counts()
+            # Skip expensive index_stats on every request
             self._json({
                 "records": rec,
                 "chunks": chk,
-                "retrieval": _get_retrieval_method(),
+                "retrieval": "hybrid_v2",
                 "model": get_model_name(),
                 "llm_ready": llm_is_ready(),
             })
+            _status_cache["data"] = {
+                "records": rec,
+                "chunks": chk,
+                "retrieval": "hybrid_v2",
+                "model": get_model_name(),
+                "llm_ready": llm_is_ready(),
+            }
+            _status_cache["last_updated"] = now
         elif self.path == "/api/recent":
             self._json({"items": recent_activities(10)})
+        elif self.path == "/api/quality":
+            report = _quality.report(days=7)
+            self._json(report.to_dict())
+        elif self.path == "/api/index-stats":
+            stats = compute_index_stats(DB_PATH)
+            self._json(stats)
         else:
             super().do_GET()
 
     def do_POST(self):
-        if self.path != "/api/chat":
+        if self.path == "/api/chat":
+            self._handle_chat()
+        else:
             self._json({"error": "Not found"}, 404)
-            return
 
+    def _handle_chat(self):
+        import traceback as _tb
         try:
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length).decode()) if length else {}
@@ -618,35 +373,78 @@ class Handler(SimpleHTTPRequestHandler):
 
         question = payload.get("question", "").strip()
         do_generate = payload.get("generate_answer", False)
-        top_k = int(payload.get("top_k", 5))
+        top_k = int(payload.get("top_k", 10))
+        force_strategy = payload.get("strategy", None)
 
         if not question:
             self._json({"error": "Question required"}, 400)
             return
 
-        t0 = time.perf_counter()
+        try:
+            t0 = time.perf_counter()
 
-        # Use FTS5-only retrieval (no cross-encoder) for speed
-        passages = retrieve(question, top_k, use_reranker=False)
+            # Step 1: Plan the query
+            query_plan = plan_query(question, top_k)
+            if force_strategy:
+                query_plan.strategy = force_strategy
 
-        if do_generate and (passages or _personal):
-            answer = generate_answer(question, passages)
-        elif passages:
-            answer = "Found %d relevant passages." % len(passages)
-        else:
-            answer = "No relevant passages found in your knowledge base."
+            # Step 2: Retrieve using planned strategy
+            results, retrieval_stats = hybrid_retrieve(
+                question,
+                top_k=query_plan.top_k,
+                db_path=DB_PATH,
+                use_reranker=query_plan.use_reranker,
+                use_vectors=query_plan.use_vectors,
+                strategy=query_plan.strategy,
+                fast_mode=(force_strategy not in ("hybrid", "vector_only", "long_context")),
+            )
 
-        elapsed = round((time.perf_counter() - t0) * 1000, 1)
-        self._json({
-            "question": question,
-            "answer": answer,
-            "passages": passages,
-            "elapsed_ms": elapsed,
-        })
+            # Step 3: Record quality metrics
+            metric = RetrievalMetric(
+                query=question,
+                query_type=query_plan.query_type.value,
+                strategy=retrieval_stats.strategy,
+                bm25_candidates=retrieval_stats.bm25_candidates,
+                vector_candidates=retrieval_stats.vector_candidates,
+                final_count=len(results),
+                elapsed_ms=retrieval_stats.elapsed_ms,
+                top_score=results[0].score if results else 0.0,
+                avg_score=sum(r.score for r in results) / max(len(results), 1),
+                score_spread=(results[0].score - results[-1].score) if len(results) > 1 else 0.0,
+                sources_count=len(set(r.source for r in results)),
+            )
+            _quality.record(metric)
+
+            # Step 4: Generate answer
+            if do_generate and (results or _personal):
+                answer = generate_answer(question, results, query_plan)
+            elif results:
+                answer = f"Found {len(results)} relevant passages."
+            else:
+                answer = "No relevant passages found in your knowledge base."
+
+            elapsed = round((time.perf_counter() - t0) * 1000, 1)
+
+            # Step 5: Build response with full provenance
+            self._json({
+                "question": question,
+                "answer": answer,
+                "passages": [r.to_dict() for r in results],
+                "elapsed_ms": elapsed,
+                "query_plan": query_plan.to_dict(),
+                "retrieval_stats": retrieval_stats.to_dict(),
+            })
+
+        except Exception as e:
+            _tb.print_exc()
+            try:
+                self._json({"error": f"Internal error: {str(e)}"}, 500)
+            except:
+                pass
 
 
 class Server(ThreadingMixIn, HTTPServer):
-    """Threaded HTTP server so LLM generation doesn't block other requests."""
+    """Threaded HTTP server."""
     allow_reuse_address = True
     daemon_threads = True
 
@@ -656,19 +454,18 @@ def main():
         d.mkdir(parents=True, exist_ok=True)
 
     rec, chk = db_counts()
-    _check_fts5()
 
     print("=" * 50)
-    print("LocalBrain - Personal AI Node")
+    print("LocalBrain - Personal AI Node v2")
     print("=" * 50)
     print(f"  Web UI:    http://localhost:{PORT}")
     print(f"  Database:  {DB_PATH}")
     print(f"  Records:   {rec}")
     print(f"  Chunks:    {chk}")
-    print(f"  Retrieval: {'Hybrid (FTS5 BM25)' if _fts5_ready else 'BM25'}")
+    print(f"  Retrieval: Hybrid v2 (BM25 + Vector + Reranker + Query Planning)")
     print(f"  LLM:       {'Ready' if llm_is_ready() else 'Not loaded'}")
     print(f"  Model:     {get_model_name()}")
-    print(f"  Profile:   {'Yes' if _personal else 'No (runtime/personal.json missing)'}")
+    print(f"  Profile:   {'Yes' if _personal else 'No'}")
     print("=" * 50)
     print("Press Ctrl+C to stop")
 

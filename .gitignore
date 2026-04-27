@@ -18,3 +18,5 @@ exports/*.jsonl
 runtime/reports/
 runtime/drafts/
 runtime/previews/  
+data/
+.stfolder/

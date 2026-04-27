@@ -201,6 +201,25 @@ INSERT OR IGNORE INTO workflow_state (key, value) VALUES
     ('last_arxiv_fetch', '{"timestamp": null, "papers_fetched": 0}'),
     ('arxiv_cooldown', '{"rejected_ids": [], "updated_at": null}');
 
+-- Retrieval quality metrics
+CREATE TABLE IF NOT EXISTS retrieval_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    query TEXT NOT NULL,
+    query_type TEXT,
+    strategy TEXT,
+    bm25_candidates INTEGER,
+    vector_candidates INTEGER,
+    final_count INTEGER,
+    elapsed_ms REAL,
+    top_score REAL,
+    avg_score REAL,
+    score_spread REAL,
+    sources_count INTEGER,
+    timestamp TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON retrieval_metrics(timestamp);
+
 -- Schema metadata
 CREATE TABLE IF NOT EXISTS schema_version (
     version TEXT PRIMARY KEY,
@@ -210,3 +229,6 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 INSERT OR IGNORE INTO schema_version (version, notes) VALUES 
     ('1.0.0', 'Initial schema for personal AI node MVP');
+
+INSERT OR IGNORE INTO schema_version (version, notes) VALUES 
+    ('1.1.0', 'Added retrieval quality metrics, smart chunking, hybrid retrieval');
