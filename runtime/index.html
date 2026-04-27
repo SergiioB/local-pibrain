@@ -10,32 +10,65 @@
 <body>
 <div class="shell">
   <section class="hero">
-    <h1>LocalBrain</h1>
-    <p>Chat with your personal knowledge base. All data stays local, inference runs on your GPU.</p>
+    <div class="hero-row">
+      <div>
+        <h1>🧠 LocalBrain</h1>
+        <p>Chat with your personal knowledge base. All data stays local, inference runs on your GPU.</p>
+      </div>
+      <div class="retrieval-badge" id="retrieval-badge">Hybrid v2</div>
+    </div>
     <div class="cards">
       <div class="card"><div class="label">Database</div><div class="value" id="db-records">0</div><div class="small">Records</div></div>
       <div class="card"><div class="label">Chunks</div><div class="value" id="db-chunks">0</div><div class="small">Indexed</div></div>
       <div class="card"><div class="label">Model</div><div class="value" id="model-name">Loading...</div><div class="small">LLM</div></div>
+      <div class="card"><div class="label">FTS5</div><div class="value" id="fts5-coverage">0%</div><div class="small">Coverage</div></div>
+      <div class="card"><div class="label">Embeddings</div><div class="value" id="emb-coverage">0%</div><div class="small">Coverage</div></div>
     </div>
   </section>
 
   <section class="panel">
-    <h2>Chat</h2>
+    <h2>💬 Chat</h2>
     <p>Ask questions about your indexed conversations, notes, and documents.</p>
     <textarea id="question" placeholder="What have I discussed about fan control on Rock 5B?"></textarea>
     <div class="controls">
       <label class="toggle"><input type="checkbox" id="genAnswer" checked><span>Generate answer with LLM</span></label>
-      <label>Top K <input type="number" id="topK" value="5" min="1" max="20" style="width:60px" title="Number of passages to retrieve. Higher = more context but slower."></label>
+      <label>Top K <input type="number" id="topK" value="10" min="1" max="30" style="width:60px" title="Number of passages to retrieve"></label>
+      <select id="strategy" title="Retrieval strategy">
+        <option value="">Auto (recommended)</option>
+        <option value="bm25_only">BM25 only (fast)</option>
+        <option value="hybrid">Hybrid (BM25 + Vector)</option>
+        <option value="long_context">Long context (more passages)</option>
+      </select>
       <button id="askBtn">Ask</button>
     </div>
     <div class="output markdown-output" id="answer">Ask a question about your data. Ctrl+Enter to submit.</div>
+
+    <!-- Query plan info -->
+    <div class="query-plan" id="query-plan" style="display:none;">
+      <div class="plan-grid">
+        <div class="plan-item"><span class="plan-label">Query Type</span><span class="plan-value" id="plan-type">-</span></div>
+        <div class="plan-item"><span class="plan-label">Strategy</span><span class="plan-value" id="plan-strategy">-</span></div>
+        <div class="plan-item"><span class="plan-label">BM25</span><span class="plan-value" id="plan-bm25">-</span></div>
+        <div class="plan-item"><span class="plan-label">Vectors</span><span class="plan-value" id="plan-vectors">-</span></div>
+        <div class="plan-item"><span class="plan-label">Results</span><span class="plan-value" id="plan-results">-</span></div>
+        <div class="plan-item"><span class="plan-label">Time</span><span class="plan-value" id="plan-time">-</span></div>
+      </div>
+    </div>
+
     <div class="output" id="passages">Passages will appear here.</div>
   </section>
 
-  <section class="panel">
-    <h2>Recent Activity</h2>
-    <div id="recent-activity">Loading...</div>
-  </section>
+  <div class="two-col">
+    <section class="panel">
+      <h2>📊 Recent Activity</h2>
+      <div id="recent-activity">Loading...</div>
+    </section>
+
+    <section class="panel">
+      <h2>📈 Quality Metrics</h2>
+      <div id="quality-metrics">Loading...</div>
+    </section>
+  </div>
 </div>
 <script src="app.js"></script>
 </body>
